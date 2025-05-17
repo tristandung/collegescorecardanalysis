@@ -1,0 +1,202 @@
+---
+title: "College Scorecard Analysis - Tristan Dung"
+format: docx
+editor: visual
+---
+
+## Introduction
+
+In this analysis, I explored how the release of the College Scorecard in September 2015 may have shifted student interest toward high-earning colleges. I used Google Trends search data to represent student interest and matched it with earnings data from the College Scorecard.
+
+The research question is: "Did the College Scorecard increase search activity for high-earning colleges compared to low-earning ones?"
+
+To answer this question, I cleaned and merged multiple data sets, created key variables for analysis, ran a regression, and visualized the results.
+
+CLEANING THE DATA:
+
+-   Loaded and combined the raw Google Trends files using import_list()
+
+-   Extracted the search date from each row using str_sub() and ymd()
+
+-   Standardized the search index within each college and keyword for comparability
+
+-   Filtered school names to only include unique matches in the ID link file
+
+-   Merged the cleaned Trends data with Scorecard earnings info using school ID
+
+```{r}
+library(rio)
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(stringr)
+
+trend_files <- list.files("data", pattern = "trends_up_to_.*\\.csv", full.names = TRUE)
+trends_raw <- import_list(trend_files, rbind = TRUE)
+
+trends_clean <- trends_raw %>%
+  mutate(date = ymd(str_sub(monthorweek, 1, 10)))
+
+trends_clean <- trends_clean %>%
+  group_by(keyword) %>%
+  mutate(index_std = (index - mean(index, na.rm = TRUE)) / sd(index, na.rm = TRUE)) %>%
+  ungroup()
+
+scorecard <- import("data/Most+Recent+Cohorts+(Scorecard+Elements).csv")
+id_link <- import("data/id_name_link.csv")
+
+id_link_unique <- id_link %>%
+  group_by(schname) %>%
+  mutate(n = n()) %>%
+  filter(n == 1) %>%
+  ungroup() %>%
+  select(-n)
+
+merged_step1 <- trends_clean %>%
+  inner_join(id_link_unique, by = "schname")
+
+scorecard <- scorecard %>%
+  rename(unitid = UNITID) %>%
+  mutate(unitid = as.character(unitid))
+
+merged_step1 <- merged_step1 %>%
+  mutate(unitid = as.character(unitid))
+
+merged_data <- merged_step1 %>%
+  inner_join(scorecard, by = "unitid")
+
+```
+
+## The Analysis:
+
+Variables:
+
+-   earnings: converts earnings data to numeric value
+
+-   median_earnings: calculates the median of all earnings, ignoring missing values
+
+-   high_earning: =1 if the college has above-median graduate earnings, 0 otherwise
+
+-   post_scorecard: =1 if the observation is after the Scorecard release (September 2015), 0 otherwise
+
+-   treated: treatment group indicator; 1 if both high_earning and post_scorecard are 1
+
+CREATING THE VARIABLES:
+
+```{r}
+merged_data$earnings <- as.numeric(merged_data$`md_earn_wne_p10-REPORTED-EARNINGS`)
+
+median_earnings <- median(merged_data$earnings, na.rm = TRUE)
+
+merged_data <- merged_data %>%
+  mutate(
+    high_earning = as.integer(earnings > median_earnings),
+    post_scorecard = as.integer(date >= as.Date("2015-09-01")),
+    treated = high_earning * post_scorecard
+  )
+
+```
+
+CREATING THE WEEKLY DATASET:
+
+-   Averaged the standardized search index (index_std) for each school and date
+
+-   Grouped by school name, date, and treatment variables to keep each school's status at that point in time
+
+```{r}
+weekly_data <- merged_data %>%
+  group_by(schname, date, high_earning, post_scorecard, treated) %>%
+  summarize(mean_index = mean(index_std, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+RUNNING THE REGRESSION:
+
+-   Used a DID design to estimate the effect of the Scorecard on search interest
+
+-   The most important variable is treated - it tells us how much search interest increased/decreased for high earning colleges after the Scorecard was released
+
+```{r}
+library(fixest)
+reg <- feols(mean_index ~ high_earning + post_scorecard + treated, data = weekly_data)
+summary(reg)
+```
+
+PLOTTING THE GRAPHS:
+
+Graph 1:
+
+-   This graph plots average search interest over time, split by high vs low earning colleges
+
+-   This helps visualize whether search trends changed more for high-earning colleges after the Scorecard was released
+
+-   The red line represents low-earning colleges, and the blue line represents high-earning colleges
+
+-   After the Scorecard release (Sep 2015), the blue and red lines slightly separate, suggesting that interest in high-earning colleges may have increased more than for low-earning ones
+
+```{r}
+library(ggplot2)
+weekly_data %>%
+  filter(!is.na(high_earning)) %>%
+  group_by(date, high_earning) %>%
+  summarize(mean_index = mean(mean_index, na.rm = TRUE)) %>%
+  ggplot(aes(x = date, y = mean_index, color = as.factor(high_earning))) +
+  geom_line() +
+  labs(
+    title = "Google Search Interest Over Time",
+    x = "Date",
+    y = "Avg Search Index",
+    color = "High Earning?"
+  ) +
+  theme_minimal()
+```
+
+Graph 2:
+
+-   This is a DID style plot showing average search interest before vs. after the Scorecard release
+
+-   The vertical difference between the red (high-earning) and blue (low-earning) lines represents the gap in interest between the two groups
+
+-   Both groups saw a drop in search interest after the Scorecard release, but the drop was smaller for high-earning colleges
+
+-   Before the release, the lines were almost overlapping. After the release, high-earning schools held onto more interest, suggesting a positive treatment effect
+
+-   This graph supports the idea that search behavior shifted slightly more favorable toward high-earning colleges after the Scorecard was released
+
+```{r}
+did_plot_data <- weekly_data %>%
+  filter(!is.na(high_earning)) %>%
+  group_by(high_earning, post_scorecard) %>%
+  summarize(mean_index = mean(mean_index, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    period = ifelse(post_scorecard == 1, "Post", "Pre"),
+    group = ifelse(high_earning == 1, "High Earning", "Low Earning")
+  ) %>%
+  filter(!is.na(period)) %>%
+  mutate(period = factor(period, levels = c("Pre", "Post")))  
+
+ggplot(did_plot_data, aes(x = period, y = mean_index, group = group, color = group)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  labs(
+    title = "Difference-in-Differences Style Plot",
+    x = "Period (Before vs. After Scorecard)",
+    y = "Avg Search Index",
+    color = "College Group"
+  ) +
+  theme_minimal()
+```
+
+## Interpretation of the Results
+
+-   The goal of this analysis was to see whether the College Scorecard shifted student interest towards high-earning colleges. Based on the results, there's some clear evidence that it did, at least a little. The regression showed a positive and statistically significant effect for the 'treated' variable, which captures colleges that were both high-earning and in the post Scorecard period. That suggests students were relatively more likely to search for these schools after the Scorecard came out.
+
+-   Before running the model, I summarized the data at the weekly level to reduce noise and make the trends easier to compare over time. I chose the DID approach because it's a straightforward way to estimate the effect of the Scorecard by comparing how search interest changed over time between high and low earning colleges. Since I wanted to capture a shift that happened at a specific point in time (Sep 2015), DID made the most sense because it helps isolate the Scorecard's impact while accounting for any differences that already existed between the two groups.
+
+-   Using this model, I was able to isolate how much more interest high-earning colleges received after the Scorecard's release. The size of the effect isn't huge (about 0.09 standard deviations), but it's enough to indicate that the policy had a real, measurable impact on behavior.
+
+-   The graphs support this interpretation. Before the Scorecard release, search interest between high and low earning colleges followed very similar paths. But after the release, those lines started to drift apart. The DID style plot makes this even clearer: interest declined for both groups, but it declined less for the high-earning colleges. That relative difference is what we'd expect if students were using the Scorecard and leaning more toward financially stronger options.
+
+-   Of course, Google Trends is just one signal. It doesn't tell us what students were thinking or whether they actually applied or enrolled. However, it's still a useful indicator of public attention, and in this case, it helps reveal that the Scorecard may have nudged students to care more about long-term earnings when considering college options.
+
+-   In the end, the Scorecard seems to have had a modest but meaningful effect: not a major shift, but a sign that giving people better information can change the way they look at higher education, even if its just a little.
